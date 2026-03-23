@@ -22,6 +22,7 @@ const DEFAULT_FILTERS = {
 export default function SearchPage() {
   const [searchParams] = useSearchParams()
   const [results, setResults] = useState([])
+  const [allResults, setAllResults] = useState([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [pages, setPages] = useState(1)
@@ -66,6 +67,7 @@ export default function SearchPage() {
       if (nextFilters.offers_delivery) params.offers_delivery = true
       if (nextFilters.offers_takeout) params.offers_takeout = true
       const response = await searchRestaurants(params)
+      setAllResults(response.data.items)
       setResults(response.data.items)
       setTotal(response.data.total)
       setPages(response.data.pages || 1)
@@ -154,7 +156,29 @@ export default function SearchPage() {
         </section>
 
         <aside>
-            <MapPreview restaurants={results} userLocation={userLocation} />
+                <MapPreview
+                  restaurants={results}
+                  userLocation={userLocation}
+                  onRedo={({ ne, sw }) => {
+                    // filter currently-loaded restaurants to those inside the viewport
+                    const [neLat, neLng] = ne
+                    const [swLat, swLng] = sw
+                    const inBounds = allResults.filter((r) => {
+                      if (!r.latitude || !r.longitude) return false
+                      const lat = Number(r.latitude)
+                      const lng = Number(r.longitude)
+                      const latMin = Math.min(swLat, neLat)
+                      const latMax = Math.max(swLat, neLat)
+                      const lngMin = Math.min(swLng, neLng)
+                      const lngMax = Math.max(swLng, neLng)
+                      return lat >= latMin && lat <= latMax && lng >= lngMin && lng <= lngMax
+                    })
+                    setResults(inBounds)
+                    setTotal(inBounds.length)
+                    setPages(1)
+                    setPage(1)
+                  }}
+                />
         </aside>
       </div>
     </div>

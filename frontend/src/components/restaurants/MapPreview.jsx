@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, CircleMarker, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import { Link } from 'react-router-dom'
@@ -108,7 +108,7 @@ function FitBounds({ points = [], userLocation = null }) {
   return null
 }
 
-export default function MapPreview({ restaurants = [], userLocation = null }) {
+export default function MapPreview({ restaurants = [], userLocation = null, onRedo = null }) {
   const points = restaurants.filter((r) => r.latitude && r.longitude).map((r) => ({
     id: r.id,
     name: r.name,
@@ -120,6 +120,21 @@ export default function MapPreview({ restaurants = [], userLocation = null }) {
 
   const center = points.length ? [points[0].latitude, points[0].longitude] : [37.7749, -122.4194]
 
+  const mapRef = useRef(null)
+
+  const handleRedo = () => {
+    if (!mapRef.current || typeof onRedo !== 'function') return
+    try {
+      const bounds = mapRef.current.getBounds()
+      const ne = bounds.getNorthEast()
+      const sw = bounds.getSouthWest()
+      const center = mapRef.current.getCenter()
+      onRedo({ ne: [ne.lat, ne.lng], sw: [sw.lat, sw.lng], center: [center.lat, center.lng] })
+    } catch (err) {
+      // ignore
+    }
+  }
+
   return (
     <div className="sticky top-28 overflow-hidden rounded-3xl border border-gray-200 bg-white shadow-sm">
       <div className="flex items-center justify-between border-b px-4 py-3">
@@ -127,11 +142,17 @@ export default function MapPreview({ restaurants = [], userLocation = null }) {
           <p className="text-sm font-semibold text-gray-900">Map preview</p>
           <p className="text-xs text-gray-500">Restaurant pins update with current results</p>
         </div>
-        <button type="button" className="rounded-full bg-red-600 px-4 py-2 text-xs font-semibold text-white">Redo search in map</button>
+        <button
+          type="button"
+          onClick={handleRedo}
+          className="rounded-full bg-red-600 px-4 py-2 text-xs font-semibold text-white"
+        >
+          Redo search in map
+        </button>
       </div>
 
       <div className="h-[540px]">
-        <MapContainer center={center} zoom={13} style={{ height: '100%', width: '100%' }}>
+        <MapContainer whenCreated={(m) => (mapRef.current = m)} center={center} zoom={13} style={{ height: '100%', width: '100%' }}>
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"

@@ -10,13 +10,13 @@ export default function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [search, setSearch] = useState({
     q: searchParams.get('q') || '',
-    location: searchParams.get('location') || 'Union City, CA 94587',
+    location: searchParams.get('location') || 'Union City, CA',
   })
 
   useEffect(() => {
     setSearch({
       q: searchParams.get('q') || '',
-      location: searchParams.get('location') || 'Union City, CA 94587',
+      location: searchParams.get('location') || 'Union City, CA',
     })
   }, [searchParams])
 

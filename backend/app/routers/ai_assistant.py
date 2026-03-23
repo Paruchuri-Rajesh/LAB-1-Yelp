@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.ai_interaction import AIInteraction
 from app.schemas.ai_assistant import AIChatRequest, AIChatResponse
-from app.services.ai_agent import generate_recommendations, stream_recommendations
+from app.services.ai_agent import generate_recommendations_payload, stream_recommendations
 from app.services.auth_service import decode_access_token
 from app.services.user_service import get_user_by_id
 
@@ -50,13 +50,7 @@ def _persist_interaction_start(db: Session, payload: AIChatRequest, user) -> AII
     return interaction
 
 
-def _finalize_interaction(
-    db: Session,
-    interaction: AIInteraction,
-    conversation_history,
-    assistant_text: str,
-    recommendations,
-):
+def _finalize_interaction(db: Session, interaction: AIInteraction, conversation_history, assistant_text: str, recommendations, route=None, used_current_context: Optional[bool] = None):
     try:
         interaction.assistant_text = assistant_text
         interaction.recommendations = recommendations
@@ -65,11 +59,29 @@ def _finalize_interaction(
             "status": "done",
             "summary": (assistant_text or "")[:200],
             "recommendation_count": len(recommendations or []),
+            "route": route,
+            "used_current_context": bool(used_current_context),
         }
         db.add(interaction)
         db.commit()
     except Exception:
         db.rollback()
+
+
+def _build_conversation_history(payload: AIChatRequest, assistant_text: str, recommendations, parsed_filters=None, route=None):
+    return _initial_conversation(payload) + [
+        {
+            "role": "user",
+            "content": payload.message,
+            "parsed_filters": parsed_filters or {},
+        },
+        {
+            "role": "assistant",
+            "content": assistant_text,
+            "recommendations": recommendations,
+            "route": route or {},
+        },
+    ]
 
 
 @router.post("/chat", response_model=AIChatResponse)
@@ -78,7 +90,6 @@ def chat_endpoint(
     db: Session = Depends(get_db),
     authorization: Optional[str] = Header(None),
 ):
-    """Canonical JSON endpoint required by the assignment spec."""
     user = _resolve_user(db, authorization)
     interaction = _persist_interaction_start(db, payload, user)
 
@@ -87,35 +98,46 @@ def chat_endpoint(
         greeting = f"Hi {name}!" if name else "Hi there!"
         greeting += " Ask me for restaurant ideas, current hours, or a follow-up like 'show me something cheaper'."
         conversation_history = _initial_conversation(payload) + [{"role": "assistant", "content": greeting}]
-        _finalize_interaction(db, interaction, conversation_history, greeting, [])
+        _finalize_interaction(db, interaction, conversation_history, greeting, [], route=None, used_current_context=False)
         return {
             "assistant_text": greeting,
             "recommendations": [],
             "conversation_history": conversation_history,
+            "route": None,
+            "used_current_context": False,
         }
 
-    assistant_text, recommendations = generate_recommendations(
+    result = generate_recommendations_payload(
         db,
         user,
         payload.message,
         payload.conversation_history,
+        client_location=payload.client_location.model_dump() if payload.client_location else None,
     )
-    conversation_history = _initial_conversation(payload) + [
-        {
-            "role": "user",
-            "content": payload.message,
-        },
-        {
-            "role": "assistant",
-            "content": assistant_text,
-            "recommendations": recommendations,
-        },
-    ]
-    _finalize_interaction(db, interaction, conversation_history, assistant_text, recommendations)
+    assistant_text = result["assistant_text"]
+    recommendations = result["recommendations"]
+    conversation_history = _build_conversation_history(
+        payload,
+        assistant_text,
+        recommendations,
+        parsed_filters=result.get("parsed_filters"),
+        route=result.get("route"),
+    )
+    _finalize_interaction(
+        db,
+        interaction,
+        conversation_history,
+        assistant_text,
+        recommendations,
+        route=result.get("route"),
+        used_current_context=result.get("used_current_context"),
+    )
     return {
         "assistant_text": assistant_text,
         "recommendations": recommendations,
         "conversation_history": conversation_history,
+        "route": result.get("route"),
+        "used_current_context": result.get("used_current_context"),
     }
 
 
@@ -125,7 +147,6 @@ def chat_json_endpoint(
     db: Session = Depends(get_db),
     authorization: Optional[str] = Header(None),
 ):
-    """Backward-compatible alias for older clients."""
     return chat_endpoint(payload, db, authorization)
 
 
@@ -146,22 +167,34 @@ def chat_stream_endpoint(
             greeting = f"Hi {name}!" if name else "Hi there!"
             greeting += " Ask me for restaurant ideas, current hours, or a follow-up like 'show me something cheaper'."
             conversation_history = _initial_conversation(payload) + [{"role": "assistant", "content": greeting}]
-            _finalize_interaction(db, interaction, conversation_history, greeting, [])
+            _finalize_interaction(db, interaction, conversation_history, greeting, [], route=None, used_current_context=False)
             yield _sse_event({"type": "assistant_chunk", "text": greeting})
             yield _sse_event({"type": "done", "conversation_history": conversation_history})
             return
 
-        assistant_text = ""
-        recommendations = []
+        result = generate_recommendations_payload(
+            db,
+            user,
+            payload.message,
+            payload.conversation_history,
+            client_location=payload.client_location.model_dump() if payload.client_location else None,
+        )
+        assistant_text = result["assistant_text"]
+        recommendations = result["recommendations"]
+
         try:
-            generator = stream_recommendations(db, user, payload.message, payload.conversation_history)
+            generator = stream_recommendations(
+                db,
+                user,
+                payload.message,
+                payload.conversation_history,
+                client_location=payload.client_location.model_dump() if payload.client_location else None,
+            )
             while True:
                 try:
                     event_type, value = next(generator)
-                except StopIteration as stop:
-                    assistant_text, recommendations = stop.value
+                except StopIteration:
                     break
-
                 if event_type == "assistant_chunk":
                     yield _sse_event({"type": "assistant_chunk", "text": value})
                 elif event_type == "recommendation":
@@ -171,19 +204,28 @@ def chat_stream_endpoint(
             recommendations = []
             yield _sse_event({"type": "assistant_chunk", "text": assistant_text})
 
-        conversation_history = _initial_conversation(payload) + [
-            {
-                "role": "user",
-                "content": payload.message,
-            },
-            {
-                "role": "assistant",
-                "content": assistant_text,
-                "recommendations": recommendations,
-            },
-        ]
-        _finalize_interaction(db, interaction, conversation_history, assistant_text, recommendations)
-        yield _sse_event({"type": "done", "conversation_history": conversation_history})
+        conversation_history = _build_conversation_history(
+            payload,
+            assistant_text,
+            recommendations,
+            parsed_filters=result.get("parsed_filters"),
+            route=result.get("route"),
+        )
+        _finalize_interaction(
+            db,
+            interaction,
+            conversation_history,
+            assistant_text,
+            recommendations,
+            route=result.get("route"),
+            used_current_context=result.get("used_current_context"),
+        )
+        yield _sse_event({
+            "type": "done",
+            "conversation_history": conversation_history,
+            "route": result.get("route"),
+            "used_current_context": result.get("used_current_context"),
+        })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -195,14 +237,16 @@ def debug_endpoint(
     authorization: Optional[str] = Header(None),
 ):
     user = _resolve_user(db, authorization)
-    assistant_text, recommendations = generate_recommendations(
+    result = generate_recommendations_payload(
         db,
         user,
         payload.message,
         payload.conversation_history,
+        client_location=payload.client_location.model_dump() if payload.client_location else None,
     )
     return {
-        "assistant_text": assistant_text,
-        "recommendations": recommendations,
+        "assistant_text": result["assistant_text"],
+        "recommendations": result["recommendations"],
+        "route": result.get("route"),
         "user_id": getattr(user, "id", None),
     }

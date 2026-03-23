@@ -1,10 +1,17 @@
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel
-from typing import Any, List, Optional
+
+
+class ClientLocation(BaseModel):
+    latitude: float
+    longitude: float
 
 
 class AIChatRequest(BaseModel):
     message: str
     conversation_history: Optional[List[Any]] = None
+    client_location: Optional[ClientLocation] = None
 
 
 class Recommendation(BaseModel):
@@ -20,6 +27,8 @@ class Recommendation(BaseModel):
     image_url: Optional[str] = None
     primary_photo: Optional[str] = None
     source: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     reason: Optional[str] = None
 
 
@@ -27,3 +36,5 @@ class AIChatResponse(BaseModel):
     assistant_text: str
     recommendations: List[Recommendation]
     conversation_history: Optional[List[Any]] = None
+    route: Optional[Dict[str, Any]] = None
+    used_current_context: Optional[bool] = None

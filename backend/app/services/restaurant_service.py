@@ -1,5 +1,5 @@
 from collections import Counter
-from math import ceil
+from math import ceil, cos, radians
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, cast, String, distinct
 from fastapi import HTTPException, status
@@ -86,6 +86,9 @@ def search_restaurants(
     has_reservations: bool | None = None,
     offers_delivery: bool | None = None,
     offers_takeout: bool | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    radius_miles: float | None = None,
 ):
     query = _restaurant_base_query(db)
 
@@ -119,6 +122,19 @@ def search_restaurants(
         query = query.filter(Restaurant.city.ilike(f"%{city}%"))
     if price_range:
         query = query.filter(Restaurant.price_range == price_range)
+
+    if latitude is not None and longitude is not None and radius_miles:
+        try:
+            lat_delta = float(radius_miles) / 69.0
+            lon_divisor = max(abs(cos(radians(float(latitude)))), 0.1)
+            lon_delta = float(radius_miles) / (69.0 * lon_divisor)
+            query = query.filter(Restaurant.latitude.isnot(None), Restaurant.longitude.isnot(None))
+            query = query.filter(Restaurant.latitude >= float(latitude) - lat_delta)
+            query = query.filter(Restaurant.latitude <= float(latitude) + lat_delta)
+            query = query.filter(Restaurant.longitude >= float(longitude) - lon_delta)
+            query = query.filter(Restaurant.longitude <= float(longitude) + lon_delta)
+        except Exception:
+            pass
     if min_rating is not None:
         query = query.filter(Restaurant.avg_rating >= min_rating)
 
