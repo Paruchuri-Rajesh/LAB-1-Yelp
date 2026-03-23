@@ -197,14 +197,10 @@ function MyReviewsTab() {
 function FavoritesTab() {
   const [favorites, setFavorites] = useState([])
   const [loading, setLoading] = useState(true)
-  const [apiDebug, setApiDebug] = useState(null)
 
   useEffect(() => {
     getMyFavorites()
-      .then((res) => {
-        setApiDebug(res.data)
-        setFavorites(res.data.items || [])
-      })
+      .then((res) => setFavorites(res.data.items || []))
       .finally(() => setLoading(false))
   }, [])
 
@@ -221,17 +217,7 @@ function FavoritesTab() {
   }, [])
 
   if (loading) return <div className="flex justify-center py-12"><Spinner /></div>
-  if (!favorites || favorites.length === 0) return (
-    <div>
-      <p className="text-gray-400 text-sm">You have no favourites yet.</p>
-      {apiDebug && (
-        <details className="mt-4 p-3 rounded bg-gray-50 text-xs text-gray-700">
-          <summary className="cursor-pointer font-medium">API response (debug)</summary>
-          <pre className="whitespace-pre-wrap mt-2">{JSON.stringify(apiDebug, null, 2)}</pre>
-        </details>
-      )}
-    </div>
-  )
+  if (!favorites || favorites.length === 0) return <p className="text-gray-400 text-sm">You have no favourites yet.</p>
 
   return (
     <div className="space-y-4">
