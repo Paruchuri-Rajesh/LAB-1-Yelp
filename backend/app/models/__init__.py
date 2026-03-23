@@ -18,6 +18,7 @@ __all__ = [
     "RestaurantPhoto",
     "RestaurantOwnership",
     "RestaurantView",
+    "Favorite",
     "Review",
     "AIInteraction",
 ]

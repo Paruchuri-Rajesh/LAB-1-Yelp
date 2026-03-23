@@ -9,6 +9,25 @@ from app.services.user_service import get_user_by_id
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
+# Optional token extractor (doesn't raise when no Authorization header present)
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
+
+
+def get_optional_current_user(
+    token: str = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db),
+):
+    if not token:
+        return None
+    try:
+        user_id = decode_access_token(token)
+    except JWTError:
+        return None
+    user = get_user_by_id(db, user_id)
+    if user is None or not user.is_active:
+        return None
+    return user
+
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),

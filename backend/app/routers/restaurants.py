@@ -11,6 +11,8 @@ from app.schemas.restaurant import (
     RestaurantImportRequest,
     RestaurantImportResponse,
 )
+from app.dependencies import get_optional_current_user
+from app.models.restaurant import Favorite
 from app.services.restaurant_service import (
     search_restaurants,
     get_restaurant_by_id,
@@ -71,6 +73,7 @@ def search(
     offers_delivery: bool | None = None,
     offers_takeout: bool | None = None,
     db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_current_user),
 ):
     items, total = search_restaurants(
         db,
@@ -105,9 +108,23 @@ def search(
             latitude=r.latitude,
             longitude=r.longitude,
             source=r.source,
+            is_favorited=False,
         )
         for r in items
     ]
+
+    # If there's a current user, annotate favorites in bulk
+    if current_user and list_items:
+        try:
+            rest_ids = [r.id for r in items]
+            fav_rows = db.query(Favorite.restaurant_id).filter(Favorite.user_id == current_user.id, Favorite.restaurant_id.in_(rest_ids)).all()
+            fav_ids = {row[0] for row in fav_rows}
+            for li in list_items:
+                if li.id in fav_ids:
+                    li.is_favorited = True
+        except Exception:
+            # don't fail search if favorites lookup fails
+            pass
     return RestaurantSearchResponse(
         items=list_items,
         total=total,

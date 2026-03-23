@@ -35,6 +35,13 @@ class Review(Base):
     def restaurant_id(self) -> int:
         return self.business_id
 
+    @property
+    def restaurant_name(self) -> str | None:
+        try:
+            return self.restaurant.name if self.restaurant else None
+        except Exception:
+            return None
+
 
 class ReviewPhoto(Base):
     __tablename__ = "review_photos"

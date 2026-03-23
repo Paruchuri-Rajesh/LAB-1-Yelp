@@ -41,6 +41,7 @@ class RestaurantListItem(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     source: str = "local"
+    is_favorited: bool = False
 
     class Config:
         from_attributes = True

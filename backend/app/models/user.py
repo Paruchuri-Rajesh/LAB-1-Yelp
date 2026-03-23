@@ -45,6 +45,7 @@ class User(Base):
         cascade="all, delete-orphan",
     )
     restaurant_views = relationship("RestaurantView", back_populates="viewer")
+    favorites = relationship("Favorite", back_populates="user", cascade="all, delete-orphan")
 
     @property
     def is_owner(self) -> bool:

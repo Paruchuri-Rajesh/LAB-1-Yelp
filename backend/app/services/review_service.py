@@ -14,7 +14,7 @@ def get_reviews_for_restaurant(
 ):
     query = (
         db.query(Review)
-        .options(joinedload(Review.user), joinedload(Review.photos))
+        .options(joinedload(Review.user), joinedload(Review.photos), joinedload(Review.restaurant))
         .filter(Review.business_id == restaurant_id)
         .order_by(Review.created_at.desc())
     )
@@ -27,7 +27,7 @@ def get_user_reviews(db: Session, user_id: int, page: int = 1, page_size: int = 
     # Primary: reviews explicitly tied to the user_id
     query = (
         db.query(Review)
-        .options(joinedload(Review.user), joinedload(Review.photos))
+        .options(joinedload(Review.user), joinedload(Review.photos), joinedload(Review.restaurant))
         .filter(Review.user_id == user_id)
         .order_by(Review.created_at.desc())
     )
@@ -43,7 +43,7 @@ def get_user_reviews(db: Session, user_id: int, page: int = 1, page_size: int = 
         if user and user.name:
             author_query = (
                 db.query(Review)
-                .options(joinedload(Review.user), joinedload(Review.photos))
+                .options(joinedload(Review.user), joinedload(Review.photos), joinedload(Review.restaurant))
                 .filter(Review.author_name.ilike(f"%{user.name}%"))
                 .order_by(Review.created_at.desc())
             )
@@ -60,6 +60,18 @@ def create_review(
     data: ReviewCreate,
     author_name: str | None = None,
 ) -> Review:
+    # prevent users with owner accounts from posting reviews at all
+    user = db.query(User).filter(User.id == user_id).first()
+    if user and getattr(user, 'is_owner', False):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account owners are not allowed to post reviews.")
+    # additionally prevent restaurant owners (ownership claim) from reviewing their own restaurant
+    from app.models.restaurant import RestaurantOwnership
+    owner_row = db.query(RestaurantOwnership).filter(
+        RestaurantOwnership.restaurant_id == restaurant_id,
+        RestaurantOwnership.owner_id == user_id,
+    ).first()
+    if owner_row:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Owners cannot review their own restaurant.")
     existing = (
         db.query(Review)
         .filter(Review.business_id == restaurant_id, Review.user_id == user_id)

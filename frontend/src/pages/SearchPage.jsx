@@ -6,6 +6,7 @@ import RestaurantCard from '../components/restaurants/RestaurantCard'
 import MapPreview from '../components/restaurants/MapPreview'
 import Spinner from '../components/ui/Spinner'
 import { searchRestaurants } from '../api/restaurants'
+import { getMyFavorites } from '../api/users'
 
 const DEFAULT_FILTERS = {
   sort_by: 'recommended',
@@ -24,6 +25,7 @@ export default function SearchPage() {
   const [results, setResults] = useState([])
   const [allResults, setAllResults] = useState([])
   const [total, setTotal] = useState(0)
+  const [favoriteIds, setFavoriteIds] = useState(new Set())
   const [page, setPage] = useState(1)
   const [pages, setPages] = useState(1)
   const [loading, setLoading] = useState(false)
@@ -67,8 +69,15 @@ export default function SearchPage() {
       if (nextFilters.offers_delivery) params.offers_delivery = true
       if (nextFilters.offers_takeout) params.offers_takeout = true
       const response = await searchRestaurants(params)
-      setAllResults(response.data.items)
-      setResults(response.data.items)
+      const items = response.data.items || []
+      setAllResults(items)
+      setResults(items)
+      try {
+        const favs = new Set(items.filter((it) => it.is_favorited).map((it) => it.id))
+        setFavoriteIds(favs)
+      } catch (err) {
+        // ignore
+      }
       setTotal(response.data.total)
       setPages(response.data.pages || 1)
       setPage(pageNumber)
@@ -83,7 +92,40 @@ export default function SearchPage() {
 
   useEffect(() => {
     fetchResults(1, filters)
+    // best-effort: fetch user's favorites so we can mark hearts on cards
+    getMyFavorites(1, 1000)
+      .then((res) => {
+        try {
+          const ids = new Set((res.data.items || []).map((r) => r.id))
+          setFavoriteIds(ids)
+        } catch (err) {
+          // ignore
+        }
+      })
+      .catch(() => {})
   }, [filters, fetchResults])
+
+  // listen for favorite changes from other components and update local sets/results
+  useEffect(() => {
+    const handler = (e) => {
+      try {
+        const { restaurantId, favorited } = e.detail || {}
+        setFavoriteIds((prev) => {
+          const next = new Set(prev)
+          if (favorited) next.add(restaurantId)
+          else next.delete(restaurantId)
+          return next
+        })
+        // also update any loaded results so cards stay in sync
+        setResults((prev) => prev.map((r) => (r.id === restaurantId ? { ...r, is_favorited: !!favorited } : r)))
+        setAllResults((prev) => prev.map((r) => (r.id === restaurantId ? { ...r, is_favorited: !!favorited } : r)))
+      } catch (err) {
+        // ignore
+      }
+    }
+    window.addEventListener('favorite:changed', handler)
+    return () => window.removeEventListener('favorite:changed', handler)
+  }, [])
 
   useEffect(() => {
     if (latParam && lonParam) {
@@ -127,7 +169,13 @@ export default function SearchPage() {
           ) : (
             <div className="space-y-5">
               {results.map((restaurant, index) => (
-                <RestaurantCard key={restaurant.id} restaurant={restaurant} index={index + (page - 1) * 8} horizontal />
+                <RestaurantCard
+                  key={restaurant.id}
+                  restaurant={restaurant}
+                  index={index + (page - 1) * 8}
+                  horizontal
+                  isFavorited={favoriteIds.has(restaurant.id)}
+                />
               ))}
             </div>
           )}

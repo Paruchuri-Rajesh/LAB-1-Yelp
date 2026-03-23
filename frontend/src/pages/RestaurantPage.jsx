@@ -160,7 +160,12 @@ export default function RestaurantPage() {
               <h2 className="text-2xl font-bold text-gray-950">Reviews</h2>
               {!user && <Link to="/login" className="text-sm font-semibold text-red-600">Log in to write a review</Link>}
             </div>
-            {user && !hasReviewed && <ReviewForm restaurantId={id} onCreated={(review) => setReviews((current) => [review, ...current])} />}
+            {user && !hasReviewed && !user.is_owner && (
+              <ReviewForm restaurantId={id} onCreated={(review) => setReviews((current) => [review, ...current])} />
+            )}
+            {user && !hasReviewed && user.is_owner && (
+              <p className="mb-5 text-sm text-gray-500">Owners are not allowed to post reviews.</p>
+            )}
             {user && hasReviewed && <p className="mb-5 text-sm text-gray-500">You already reviewed this restaurant.</p>}
 
             {reviewsLoading ? (

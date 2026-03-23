@@ -65,6 +65,12 @@ class Restaurant(Base):
         cascade="all, delete-orphan",
     )
 
+    favorites = relationship(
+        "Favorite",
+        back_populates="restaurant",
+        cascade="all, delete-orphan",
+    )
+
     @property
     def is_active(self) -> bool:
         return not bool(self.is_closed)
@@ -128,3 +134,15 @@ class RestaurantView(Base):
 
     restaurant = relationship("Restaurant", back_populates="views")
     viewer = relationship("User", back_populates="restaurant_views")
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    restaurant_id = Column(Integer, ForeignKey("businesses.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+
+    restaurant = relationship("Restaurant", back_populates="favorites")
+    user = relationship("User", back_populates="favorites")

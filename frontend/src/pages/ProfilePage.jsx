@@ -4,9 +4,11 @@ import { useAuth } from '../contexts/AuthContext'
 import AvatarUpload from '../components/profile/AvatarUpload'
 import ProfileForm from '../components/profile/ProfileForm'
 import ReviewCard from '../components/reviews/ReviewCard'
+import RestaurantCard from '../components/restaurants/RestaurantCard'
 import Spinner from '../components/ui/Spinner'
 import { getMyReviews } from '../api/users'
 import { getPreferences, updatePreferences } from '../api/users'
+import { getMyFavorites } from '../api/users'
 import { CUISINES, DIETARY, AMBIANCE, PRICE_RANGES, SORT_OPTIONS } from '../utils/constants'
 
 function PreferencesTab() {
@@ -191,10 +193,60 @@ function MyReviewsTab() {
   )
 }
 
+
+function FavoritesTab() {
+  const [favorites, setFavorites] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [apiDebug, setApiDebug] = useState(null)
+
+  useEffect(() => {
+    getMyFavorites()
+      .then((res) => {
+        setApiDebug(res.data)
+        setFavorites(res.data.items || [])
+      })
+      .finally(() => setLoading(false))
+  }, [])
+
+  // refresh favorites list when other parts of the app change favorites
+  useEffect(() => {
+    const handler = () => {
+      setLoading(true)
+      getMyFavorites()
+        .then((res) => setFavorites(res.data.items || []))
+        .finally(() => setLoading(false))
+    }
+    window.addEventListener('favorite:changed', handler)
+    return () => window.removeEventListener('favorite:changed', handler)
+  }, [])
+
+  if (loading) return <div className="flex justify-center py-12"><Spinner /></div>
+  if (!favorites || favorites.length === 0) return (
+    <div>
+      <p className="text-gray-400 text-sm">You have no favourites yet.</p>
+      {apiDebug && (
+        <details className="mt-4 p-3 rounded bg-gray-50 text-xs text-gray-700">
+          <summary className="cursor-pointer font-medium">API response (debug)</summary>
+          <pre className="whitespace-pre-wrap mt-2">{JSON.stringify(apiDebug, null, 2)}</pre>
+        </details>
+      )}
+    </div>
+  )
+
+  return (
+    <div className="space-y-4">
+      {favorites.map((r, idx) => (
+        <RestaurantCard key={r.id} restaurant={r} index={idx} horizontal isFavorited />
+      ))}
+    </div>
+  )
+}
+
 const TABS = [
   { id: 'info',        label: 'Profile Info' },
   { id: 'preferences', label: 'Preferences' },
   { id: 'reviews',     label: 'My Reviews' },
+  { id: 'favorites',   label: 'Favourites' },
 ]
 
 export default function ProfilePage() {
@@ -243,6 +295,7 @@ export default function ProfilePage() {
           {activeTab === 'info'        && <ProfileForm />}
           {activeTab === 'preferences' && <PreferencesTab />}
           {activeTab === 'reviews'     && <MyReviewsTab />}
+          {activeTab === 'favorites'   && <FavoritesTab />}
         </div>
       </div>
     </div>

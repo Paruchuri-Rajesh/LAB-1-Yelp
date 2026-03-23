@@ -1,6 +1,8 @@
 import { Link } from 'react-router-dom'
+import { useState, useEffect } from 'react'
 import { formatRating, getMediaUrl } from '../../utils/formatters'
 import StarRating from '../ui/StarRating'
+import { addFavorite, removeFavorite } from '../../api/users'
 
 function ActionButton({ restaurant, actionLabel, onAction }) {
   if (onAction) {
@@ -31,7 +33,44 @@ export default function RestaurantCard({
   horizontal = false,
   actionLabel = 'View details',
   onAction,
+  isFavorited = false,
 }) {
+  const [fav, setFav] = useState(!!isFavorited)
+  const [favLoading, setFavLoading] = useState(false)
+
+  const toggleFav = async () => {
+    if (favLoading) return
+    // optimistic UI
+    const newFav = !fav
+    setFav(newFav)
+    setFavLoading(true)
+    try {
+      if (!newFav) {
+        // user just unfavorited
+        await removeFavorite(restaurant.id)
+      } else {
+        await addFavorite(restaurant.id)
+      }
+      // notify other parts of the app that favorites changed
+      try {
+        const ev = new CustomEvent('favorite:changed', { detail: { restaurantId: restaurant.id, favorited: newFav } })
+        window.dispatchEvent(ev)
+      } catch (e) {
+        // ignore
+      }
+    } catch (err) {
+      // revert on error
+      setFav(!newFav)
+      console.error('Favorite toggle failed', err)
+    } finally {
+      setFavLoading(false)
+    }
+  }
+
+  // keep local state in sync if parent changes isFavorited prop
+  useEffect(() => {
+    setFav(!!isFavorited)
+  }, [isFavorited])
   const image =
     getMediaUrl(restaurant.primary_photo || restaurant.image_url) ||
     'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=1200&q=80'
@@ -59,7 +98,7 @@ export default function RestaurantCard({
                 <span className="flex h-8 w-8 items-center justify-center rounded-full bg-red-50 text-sm font-bold text-red-600">
                   {index + 1}
                 </span>
-                <h3 className="truncate text-2xl font-bold text-gray-900">{restaurant.name}</h3>
+                  <h3 className="truncate text-2xl font-bold text-gray-900">{restaurant.name}</h3>
               </div>
 
               <div className="flex flex-wrap items-center gap-2 text-sm text-gray-600">
@@ -71,8 +110,19 @@ export default function RestaurantCard({
               </div>
             </div>
 
-            <div className="hidden md:block">
-              <ActionButton restaurant={restaurant} actionLabel={actionLabel} onAction={onAction} />
+            <div className="hidden md:flex items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleFav}
+                aria-pressed={fav}
+                disabled={favLoading}
+                className={`${fav ? 'text-red-600' : 'text-gray-400'} hover:text-red-600 ${favLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+              >
+                {fav ? '♥' : '♡'}
+              </button>
+              <div className="hidden md:block">
+                <ActionButton restaurant={restaurant} actionLabel={actionLabel} onAction={onAction} />
+              </div>
             </div>
           </div>
 
@@ -93,7 +143,18 @@ export default function RestaurantCard({
           </div>
 
           <div className="mt-4 md:hidden">
-            <ActionButton restaurant={restaurant} actionLabel={actionLabel} onAction={onAction} />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleFav}
+                aria-pressed={fav}
+                disabled={favLoading}
+                className={`${fav ? 'text-red-600' : 'text-gray-400'} hover:text-red-600 ${favLoading ? 'opacity-60 cursor-not-allowed' : ''}`}
+              >
+                {fav ? '♥' : '♡'}
+              </button>
+              <ActionButton restaurant={restaurant} actionLabel={actionLabel} onAction={onAction} />
+            </div>
           </div>
         </div>
       </div>

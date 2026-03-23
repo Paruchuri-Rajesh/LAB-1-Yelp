@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import Avatar from '../ui/Avatar'
+import { Link } from 'react-router-dom'
 import StarRating from '../ui/StarRating'
 import { formatDate, getMediaUrl } from '../../utils/formatters'
 import { useAuth } from '../../contexts/AuthContext'
@@ -44,6 +45,9 @@ export default function ReviewCard({ review, restaurantId, onUpdated, onDeleted 
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-medium text-gray-900 text-sm">{review.user?.name || review.author_name || 'Anonymous'}</span>
+            {review.restaurant_name ? (
+              <Link to={`/restaurants/${restaurantId || review.restaurant_id}`} className="text-sm text-gray-500 hover:text-red-600">· {review.restaurant_name}</Link>
+            ) : null}
             <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-gray-500">{review.source}</span>
             <span className="text-xs text-gray-400">{formatDate(review.created_at || review.visited_at)}</span>
           </div>

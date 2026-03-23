@@ -55,6 +55,7 @@ class ReviewPhotoRead(BaseModel):
 class ReviewRead(BaseModel):
     id: int
     restaurant_id: int
+    restaurant_name: Optional[str] = None
     user_id: Optional[int] = None
     rating: int
     title: Optional[str] = None
