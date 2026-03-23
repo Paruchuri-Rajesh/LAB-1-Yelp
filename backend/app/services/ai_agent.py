@@ -1,524 +1,685 @@
-from typing import Any, Dict, List, Optional, Tuple
-from app.services import restaurant_service, review_service
-from app.database import get_db
-from sqlalchemy.orm import Session
-import re
+from __future__ import annotations
+
 import json
-from app.services.user_service import get_user_by_id
 import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.services import restaurant_service
+from app.services.user_service import get_user_by_id
 
 logger = logging.getLogger(__name__)
 
+COMMON_CUISINES = [
+    "italian", "chinese", "mexican", "indian", "japanese", "thai", "french",
+    "american", "mediterranean", "korean", "vietnamese", "greek", "pizza",
+    "sushi", "seafood", "bbq", "burgers", "dessert", "coffee", "brunch",
+]
+DIETARY_TERMS = [
+    "vegetarian", "vegan", "halal", "gluten-free", "gluten free", "kosher",
+    "dairy-free", "dairy free", "pescatarian",
+]
+AMBIANCE_TERMS = [
+    "casual", "fine dining", "family-friendly", "family friendly", "romantic",
+    "outdoor seating", "wifi", "quiet", "lively", "cozy", "upscale", "trendy",
+    "brunch", "date night", "bar", "rooftop",
+]
+CURRENT_CONTEXT_HINTS = re.compile(
+    r"\b(open|opening|hours|hour|tonight|today|tomorrow|weekend|current|trending|special|event|events|busy|popular)\b",
+    re.IGNORECASE,
+)
+FOLLOW_UP_HINTS = re.compile(
+    r"\b(another|else|instead|same|similar|cheaper|pricier|expensive|romantic|casual|closer|nearer|more|less|what about|how about)\b",
+    re.IGNORECASE,
+)
+SORT_MAP = {
+    "rating": "rating",
+    "best": "rating",
+    "popular": "review_count",
+    "popularity": "review_count",
+    "reviews": "review_count",
+    "price": "price",
+    "cheapest": "price",
+    "distance": "recommended",
+    "nearby": "recommended",
+    "recommended": "recommended",
+    "newest": "newest",
+}
 
-def _simple_extract(message: str) -> Dict[str, Optional[str]]:
-    """Very small rule-based extractor for cuisine, price, dietary, and occasion."""
-    out = {"cuisine": None, "price_range": None, "dietary": None, "occasion": None, "location": None}
-    msg = message.lower()
-    # cuisine (common list)
-    cuisines = ["italian", "french", "japanese", "sushi", "vegan", "thai", "mexican", "indian", "chinese"]
-    for c in cuisines:
-        if c in msg:
-            out["cuisine"] = c if c != "sushi" else "japanese"
-            break
 
-    # price signs
-    if "$" in message:
-        # map $$ -> $$ etc by counting
-        dollars = message.count("$")
-        out["price_range"] = "$" * min(max(dollars, 1), 3)
-    else:
-        if "cheap" in msg or "affordable" in msg or "casual" in msg:
-            out["price_range"] = "$"
-        if "mid" in msg or "moderate" in msg or "mid-range" in msg:
-            out["price_range"] = "$$"
-        if "expensive" in msg or "romantic" in msg or "special" in msg:
-            out["price_range"] = "$$$"
+class ExtractedQuery(BaseModel):
+    cuisine: Optional[str] = None
+    price_range: Optional[str] = None
+    dietary: List[str] = Field(default_factory=list)
+    occasion: Optional[str] = None
+    ambiance: List[str] = Field(default_factory=list)
+    location: Optional[str] = None
+    keywords: List[str] = Field(default_factory=list)
+    sort_preference: Optional[str] = None
+    wants_current_context: bool = False
 
-    # dietary
-    if "vegan" in msg:
-        out["dietary"] = "vegan"
-    elif "vegetarian" in msg:
-        out["dietary"] = "vegetarian"
 
-    # occasion
-    if "anniversary" in msg or "romantic" in msg or "date" in msg:
-        out["occasion"] = "romantic"
-    if "dinner" in msg:
-        out["occasion"] = out.get("occasion") or "dinner"
+def _normalize_price(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = str(value).strip()
+    dollars = value.count("$")
+    if dollars:
+        return "$" * min(max(dollars, 1), 4)
+    lowered = value.lower()
+    if any(term in lowered for term in ["cheap", "budget", "affordable", "low"]):
+        return "$"
+    if any(term in lowered for term in ["mid", "moderate", "average"]):
+        return "$$"
+    if any(term in lowered for term in ["expensive", "upscale", "fancy", "special"]):
+        return "$$$"
+    return None
 
-    # location (improved: look for 'near <place>' or 'in <city>' anywhere)
-    m = re.search(r"(?:near|in) ([A-Za-z\s]+?)(?:\b|$)", message, re.IGNORECASE)
-    if m:
-        loc = m.group(1).strip()
-        # strip trailing stop words
-        loc = re.sub(r"\b(please|thanks|thanks\b).*$", "", loc, flags=re.IGNORECASE).strip()
-        out["location"] = loc
 
+def _price_rank(value: Optional[str]) -> int:
+    if not value:
+        return 0
+    return min(value.count("$"), 4)
+
+
+def _normalize_sort(value: Optional[str]) -> str:
+    if not value:
+        return "recommended"
+    key = str(value).strip().lower()
+    return SORT_MAP.get(key, "recommended")
+
+
+def _clean_location(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = re.sub(r"\b(please|thanks|thank you|tonight|today|now)\b", "", value, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return cleaned or None
+
+
+def _dedupe(values: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
     return out
 
 
-def _restaurant_to_recommendation(r) -> Dict[str, Any]:
+def _history_messages(conversation_history: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    if not conversation_history:
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for item in conversation_history:
+        if isinstance(item, dict):
+            cleaned.append(item)
+    return cleaned
+
+
+def _history_has_recommendations(conversation_history: Optional[List[Any]]) -> bool:
+    for item in _history_messages(conversation_history):
+        recs = item.get("recommendations")
+        if isinstance(recs, list) and recs:
+            return True
+    return False
+
+
+def _build_history_summary(conversation_history: Optional[List[Any]], limit: int = 6) -> str:
+    snippets: List[str] = []
+    for item in _history_messages(conversation_history)[-limit:]:
+        role = item.get("role") or "user"
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        snippets.append(f"{role}: {content[:220]}")
+    return "\n".join(snippets)
+
+
+def _simple_extract(message: str) -> Dict[str, Any]:
+    text = (message or "").strip()
+    lowered = text.lower()
+    extracted: Dict[str, Any] = {
+        "cuisine": None,
+        "price_range": _normalize_price(text),
+        "dietary": [],
+        "occasion": None,
+        "ambiance": [],
+        "location": None,
+        "keywords": [],
+        "sort_preference": None,
+        "wants_current_context": bool(CURRENT_CONTEXT_HINTS.search(text)),
+    }
+
+    for cuisine in COMMON_CUISINES:
+        if re.search(rf"\b{re.escape(cuisine)}\b", lowered):
+            extracted["cuisine"] = "japanese" if cuisine == "sushi" else cuisine
+            break
+
+    if not extracted["price_range"]:
+        if any(word in lowered for word in ["cheap", "budget", "affordable"]):
+            extracted["price_range"] = "$"
+        elif any(word in lowered for word in ["mid-range", "mid range", "moderate"]):
+            extracted["price_range"] = "$$"
+        elif any(word in lowered for word in ["expensive", "fancy", "upscale"]):
+            extracted["price_range"] = "$$$"
+
+    for term in DIETARY_TERMS:
+        if term in lowered:
+            normalized = term.replace(" ", "-")
+            extracted["dietary"].append(normalized)
+
+    if any(word in lowered for word in ["anniversary", "date", "romantic"]):
+        extracted["occasion"] = "romantic"
+    elif "dinner" in lowered:
+        extracted["occasion"] = "dinner"
+    elif "lunch" in lowered:
+        extracted["occasion"] = "lunch"
+    elif "brunch" in lowered:
+        extracted["occasion"] = "brunch"
+
+    for term in AMBIANCE_TERMS:
+        if term in lowered:
+            extracted["ambiance"].append(term.replace(" ", "-"))
+
+    loc_match = re.search(
+        r"(?:near|in|around|at)\s+([A-Za-z][A-Za-z\s,.-]{1,60})(?:$|\b(?:with|for|that|which|under|around|and)\b)",
+        text,
+        re.IGNORECASE,
+    )
+    if loc_match:
+        extracted["location"] = _clean_location(loc_match.group(1))
+
+    if re.search(r"\b(best rated|highest rated|top rated)\b", lowered):
+        extracted["sort_preference"] = "rating"
+    elif re.search(r"\b(popular|most popular|trending)\b", lowered):
+        extracted["sort_preference"] = "review_count"
+    elif re.search(r"\b(cheapest|lowest price)\b", lowered):
+        extracted["sort_preference"] = "price"
+
+    keyword_hits: List[str] = []
+    for word in ["wifi", "quiet", "patio", "outdoor", "family", "romantic", "vegan", "vegetarian", "delivery", "takeout"]:
+        if re.search(rf"\b{re.escape(word)}\b", lowered):
+            keyword_hits.append(word)
+    if extracted["occasion"]:
+        keyword_hits.append(extracted["occasion"])
+    extracted["keywords"] = _dedupe(keyword_hits)
+    extracted["dietary"] = _dedupe(extracted["dietary"])
+    extracted["ambiance"] = _dedupe(extracted["ambiance"])
+    return extracted
+
+
+def _extract_with_langchain(
+    message: str,
+    conversation_history: Optional[List[Any]],
+    preferences: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    try:
+        from langchain.output_parsers import PydanticOutputParser
+        from langchain.prompts import PromptTemplate
+        from app.config import settings
+        from app.services.ai_agent_ollama import call_ollama
+    except Exception:
+        return None
+
+    if not settings.OLLAMA_URL or not settings.OLLAMA_MODEL:
+        return None
+
+    parser = PydanticOutputParser(pydantic_object=ExtractedQuery)
+    prompt = PromptTemplate(
+        template=(
+            "You extract restaurant recommendation filters from user messages.\n"
+            "Saved preferences: {preferences}\n"
+            "Conversation history:\n{history}\n\n"
+            "Latest user message: {message}\n\n"
+            "Return only valid JSON matching these instructions:\n{format_instructions}\n"
+            "Use null for unknown scalar values and [] for unknown list values.\n"
+            "Infer follow-up requests from conversation history.\n"
+            "Set wants_current_context=true for questions about current hours, events, tonight, today, or trending places."
+        ),
+        input_variables=["preferences", "history", "message"],
+        partial_variables={"format_instructions": parser.get_format_instructions()},
+    )
+
+    try:
+        rendered = prompt.format(
+            preferences=json.dumps(preferences, ensure_ascii=False),
+            history=_build_history_summary(conversation_history),
+            message=message,
+        )
+        raw = call_ollama(rendered, max_tokens=400, temperature=0.0)
+        cleaned = str(raw or "").strip()
+        fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1)
+        parsed = parser.parse(cleaned)
+        data = parsed.model_dump()
+        data["price_range"] = _normalize_price(data.get("price_range"))
+        data["location"] = _clean_location(data.get("location"))
+        data["sort_preference"] = _normalize_sort(data.get("sort_preference"))
+        data["dietary"] = _dedupe([str(item).lower() for item in data.get("dietary", [])])
+        data["ambiance"] = _dedupe([str(item).lower() for item in data.get("ambiance", [])])
+        data["keywords"] = _dedupe([str(item).lower() for item in data.get("keywords", [])])
+        return data
+    except Exception as exc:
+        logger.debug("LangChain extraction failed: %s", exc)
+        return None
+
+
+def _load_user_preferences(db: Session, user: Optional[Any]) -> Dict[str, Any]:
+    preferences: Dict[str, Any] = {
+        "cuisine_preferences": [],
+        "price_range": None,
+        "dietary_restrictions": [],
+        "ambiance_preferences": [],
+        "preferred_locations": [],
+        "sort_preference": "rating",
+        "search_radius_miles": 10,
+    }
+    try:
+        if user and getattr(user, "id", None):
+            user = get_user_by_id(db, int(user.id)) or user
+            pref = getattr(user, "preferences", None)
+            if pref:
+                preferences["cuisine_preferences"] = pref.cuisine_preferences or []
+                preferences["price_range"] = getattr(pref, "price_range", None)
+                preferences["dietary_restrictions"] = pref.dietary_restrictions or []
+                preferences["ambiance_preferences"] = pref.ambiance_preferences or []
+                preferences["preferred_locations"] = pref.preferred_locations or []
+                preferences["sort_preference"] = getattr(pref, "sort_preference", None) or "rating"
+                preferences["search_radius_miles"] = getattr(pref, "search_radius_miles", 10) or 10
+    except Exception as exc:
+        logger.debug("Failed to load user preferences: %s", exc)
+    return preferences
+
+
+def _merge_filters(
+    message: str,
+    extracted: Dict[str, Any],
+    conversation_history: Optional[List[Any]],
+    preferences: Dict[str, Any],
+) -> Dict[str, Any]:
+    resolved = dict(extracted)
+    history_filters: List[Dict[str, Any]] = []
+    for item in _history_messages(conversation_history):
+        if item.get("role") != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            history_filters.append(_simple_extract(content))
+
+    for hist in history_filters:
+        if not resolved.get("cuisine") and hist.get("cuisine"):
+            resolved["cuisine"] = hist["cuisine"]
+        if not resolved.get("location") and hist.get("location"):
+            resolved["location"] = hist["location"]
+        if not resolved.get("occasion") and hist.get("occasion"):
+            resolved["occasion"] = hist["occasion"]
+        if not resolved.get("price_range") and hist.get("price_range"):
+            resolved["price_range"] = hist["price_range"]
+        resolved["dietary"] = _dedupe((hist.get("dietary") or []) + (resolved.get("dietary") or []))
+        resolved["ambiance"] = _dedupe((hist.get("ambiance") or []) + (resolved.get("ambiance") or []))
+        resolved["keywords"] = _dedupe((hist.get("keywords") or []) + (resolved.get("keywords") or []))
+        if not resolved.get("sort_preference") and hist.get("sort_preference"):
+            resolved["sort_preference"] = hist["sort_preference"]
+        resolved["wants_current_context"] = bool(resolved.get("wants_current_context") or hist.get("wants_current_context"))
+
+    lowered = (message or "").lower()
+    base_price = resolved.get("price_range") or preferences.get("price_range")
+    if "cheaper" in lowered or "less expensive" in lowered:
+        rank = max(_price_rank(base_price) - 1, 1)
+        resolved["price_range"] = "$" * rank
+        resolved["sort_preference"] = "price"
+    elif any(word in lowered for word in ["fancier", "nicer", "more expensive", "upscale"]):
+        rank = min(max(_price_rank(base_price), 1) + 1, 4)
+        resolved["price_range"] = "$" * rank
+
+    if not resolved.get("cuisine") and preferences.get("cuisine_preferences"):
+        resolved["cuisine"] = preferences["cuisine_preferences"][0]
+    if not resolved.get("price_range") and preferences.get("price_range"):
+        resolved["price_range"] = str(preferences["price_range"])
+    if not resolved.get("location") and preferences.get("preferred_locations"):
+        resolved["location"] = preferences["preferred_locations"][0]
+    if not resolved.get("sort_preference") and preferences.get("sort_preference"):
+        resolved["sort_preference"] = str(preferences["sort_preference"])
+    resolved["dietary"] = _dedupe((resolved.get("dietary") or []) + (preferences.get("dietary_restrictions") or []))
+    resolved["ambiance"] = _dedupe((resolved.get("ambiance") or []) + (preferences.get("ambiance_preferences") or []))
+    resolved["sort_preference"] = _normalize_sort(resolved.get("sort_preference"))
+    resolved["price_range"] = _normalize_price(resolved.get("price_range"))
+    resolved["location"] = _clean_location(resolved.get("location"))
+
+    if "romantic" in lowered and "romantic" not in resolved["ambiance"]:
+        resolved["ambiance"].append("romantic")
+        resolved["occasion"] = resolved.get("occasion") or "romantic"
+    if "casual" in lowered and "casual" not in resolved["ambiance"]:
+        resolved["ambiance"].append("casual")
+    if "family" in lowered and "family-friendly" not in resolved["ambiance"]:
+        resolved["ambiance"].append("family-friendly")
+
+    return resolved
+
+
+def _is_recommendation_query(message: str, conversation_history: Optional[List[Any]]) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    recommendation_terms = [
+        "recommend", "suggest", "find", "best", "restaurant", "restaurants", "eat", "dine",
+        "dinner", "lunch", "brunch", "breakfast", "vegan", "vegetarian", "date", "anniversary",
+        "near me", "nearby", "takeout", "delivery", "open", "hours", "romantic", "casual",
+    ]
+    if any(term in text for term in recommendation_terms):
+        return True
+    return bool(_history_has_recommendations(conversation_history) and FOLLOW_UP_HINTS.search(text))
+
+
+def _build_search_text(message: str, resolved: Dict[str, Any]) -> Optional[str]:
+    pieces = []
+    for value in resolved.get("keywords") or []:
+        pieces.append(value)
+    if resolved.get("occasion"):
+        pieces.append(resolved["occasion"])
+    if not pieces:
+        lowered = (message or "").lower()
+        if len(lowered.split()) <= 4 and not _clean_location(lowered):
+            pieces.append(lowered)
+    joined = " ".join(_dedupe([piece for piece in pieces if piece]))
+    return joined or None
+
+
+def _restaurant_to_recommendation(restaurant: Any) -> Dict[str, Any]:
     return {
-        "id": r.id,
-        "name": r.name,
-        "avg_rating": float(r.avg_rating or 0),
-        "review_count": int(r.review_count or 0),
-        "price_range": r.price_range,
-        "cuisine_type": r.cuisine_type,
+        "id": restaurant.id,
+        "name": restaurant.name,
+        "avg_rating": float(restaurant.avg_rating or 0),
+        "review_count": int(restaurant.review_count or 0),
+        "price_range": restaurant.price_range,
+        "cuisine_type": restaurant.cuisine_type,
+        "address": restaurant.address,
+        "city": restaurant.city,
+        "state": restaurant.state,
+        "image_url": getattr(restaurant, "image_url", None),
+        "primary_photo": getattr(restaurant, "primary_photo", None),
+        "source": getattr(restaurant, "source", None),
+        "reason": None,
     }
 
 
+def _restaurant_blob(restaurant: Any) -> str:
+    data = [
+        restaurant.name,
+        restaurant.cuisine_type,
+        restaurant.description,
+        restaurant.address,
+        restaurant.city,
+        restaurant.state,
+    ]
+    try:
+        if getattr(restaurant, "keywords", None):
+            data.append(json.dumps(restaurant.keywords))
+        if getattr(restaurant, "amenities", None):
+            data.append(json.dumps(restaurant.amenities))
+    except Exception:
+        pass
+    return " ".join([str(part) for part in data if part]).lower()
+
+
+def _score_restaurant(restaurant: Any, resolved: Dict[str, Any], preferences: Dict[str, Any], search_text: Optional[str]) -> Tuple[float, List[str]]:
+    score = float(restaurant.avg_rating or 0) * 20 + min(int(restaurant.review_count or 0), 500) / 10
+    reasons: List[str] = []
+    blob = _restaurant_blob(restaurant)
+
+    cuisine = (resolved.get("cuisine") or "").lower()
+    if cuisine and cuisine in (restaurant.cuisine_type or "").lower():
+        score += 30
+        reasons.append(f"matches your {cuisine} preference")
+
+    for pref in preferences.get("cuisine_preferences") or []:
+        pref_text = str(pref).lower()
+        if pref_text and pref_text in (restaurant.cuisine_type or "").lower():
+            score += 12
+            if "saved preferences" not in " ".join(reasons):
+                reasons.append("fits your saved cuisine preferences")
+            break
+
+    resolved_price = resolved.get("price_range")
+    if resolved_price and restaurant.price_range == resolved_price:
+        score += 14
+        reasons.append(f"matches your {resolved_price} budget")
+    elif resolved_price and restaurant.price_range:
+        diff = abs(_price_rank(restaurant.price_range) - _price_rank(resolved_price))
+        score += max(0, 8 - diff * 3)
+
+    for dietary in resolved.get("dietary") or []:
+        if dietary.replace("-", " ") in blob or dietary in blob:
+            score += 10
+            reasons.append(f"mentions {dietary.replace('-', ' ')} options")
+
+    for ambiance in resolved.get("ambiance") or []:
+        check = ambiance.replace("-", " ")
+        if check in blob or ambiance in blob:
+            score += 8
+            reasons.append(f"has a {check} vibe")
+
+    if resolved.get("occasion") == "romantic" and any(term in blob for term in ["romantic", "date", "upscale", "wine", "cozy"]):
+        score += 10
+        reasons.append("works well for a romantic outing")
+
+    location = (resolved.get("location") or "").lower()
+    if location and location in blob:
+        score += 14
+        reasons.append(f"is around {resolved['location']}")
+
+    if search_text:
+        for word in search_text.lower().split():
+            if word in blob:
+                score += 3
+
+    return score, _dedupe(reasons)
+
+
+def _maybe_enrich_with_tavily(message: str, restaurants: List[Any]) -> Dict[int, str]:
+    if not restaurants:
+        return {}
+    try:
+        from app.config import settings
+        from app.services.ai_agent_tavily import search as tavily_search
+    except Exception:
+        return {}
+
+    if not settings.TAVILY_URL or not CURRENT_CONTEXT_HINTS.search(message or ""):
+        return {}
+
+    context: Dict[int, str] = {}
+    for restaurant in restaurants[:3]:
+        query = f"{restaurant.name} {restaurant.city or ''} current hours specials events trending restaurant"
+        try:
+            hits = tavily_search(query, limit=1)
+        except Exception:
+            continue
+        if hits:
+            snippet = (hits[0].get("snippet") or "").strip()
+            if snippet:
+                context[restaurant.id] = snippet[:180]
+    return context
+
+
+def _build_assistant_text(
+    resolved: Dict[str, Any],
+    preferences: Dict[str, Any],
+    recommendations: List[Dict[str, Any]],
+    used_current_context: bool,
+) -> str:
+    if not recommendations:
+        parts = ["I couldn't find a strong match with the current filters."]
+        if resolved.get("location"):
+            parts.append(f"Try expanding beyond {resolved['location']}.")
+        parts.append("You can also ask me for a different cuisine, budget, or vibe and I'll refine the search.")
+        return " ".join(parts)
+
+    summary_bits: List[str] = ["Here are some restaurant picks"]
+    if resolved.get("location"):
+        summary_bits.append(f"around {resolved['location']}")
+    if resolved.get("cuisine"):
+        summary_bits.append(f"for {resolved['cuisine']} food")
+    if resolved.get("occasion") and resolved.get("occasion") not in ["dinner", "lunch", "brunch"]:
+        summary_bits.append(f"that fit a {resolved['occasion']} occasion")
+    if resolved.get("price_range"):
+        summary_bits.append(f"within a {resolved['price_range']} budget")
+
+    preference_notes: List[str] = []
+    if preferences.get("cuisine_preferences"):
+        preference_notes.append("your saved cuisine preferences")
+    if preferences.get("dietary_restrictions"):
+        preference_notes.append("your dietary settings")
+    if preferences.get("ambiance_preferences"):
+        preference_notes.append("your ambiance preferences")
+
+    text = " ".join(summary_bits) + "."
+    if preference_notes:
+        text += f" I also used {', '.join(preference_notes)} to rank them."
+    if used_current_context:
+        text += " I checked current web context for the top matches when it looked relevant."
+    text += " Tap any card to open the full restaurant details page."
+    return text
+
+
 def build_system_prompt(user: Optional[Any], prefs: Dict[str, Any]) -> str:
-    """Return a short system prompt fragment that summarizes user identity and preferences.
-
-    This is intentionally compact to avoid token bloat when prepending to streaming prompts.
-    """
-    parts: List[str] = ["You are an assistant personalized to the requesting user."]
-    try:
-        if user and getattr(user, "id", None):
-            uname = getattr(user, "name", None) or getattr(user, "username", None) or ""
-            parts.append(f"UserID: {getattr(user, 'id')} name: {uname}")
-    except Exception:
-        pass
-
-    try:
-        if prefs:
-            if prefs.get("cuisine_preferences"):
-                parts.append(f"Saved cuisine preferences: {prefs.get('cuisine_preferences')}")
-            if prefs.get("price_range"):
-                parts.append(f"Saved price_range: {prefs.get('price_range')}")
-            if prefs.get("dietary"):
-                parts.append(f"Saved dietary: {prefs.get('dietary')}")
-    except Exception:
-        pass
-
+    parts = ["You are a restaurant recommendation assistant."]
+    if user and getattr(user, "id", None):
+        parts.append(f"User ID: {user.id}")
+    if prefs.get("cuisine_preferences"):
+        parts.append(f"Saved cuisines: {prefs['cuisine_preferences']}")
+    if prefs.get("price_range"):
+        parts.append(f"Saved budget: {prefs['price_range']}")
+    if prefs.get("dietary_restrictions"):
+        parts.append(f"Dietary restrictions: {prefs['dietary_restrictions']}")
     return "\n".join(parts)
 
 
-def generate_recommendations(db: Session, user: Optional[Any], message: str, conversation_history: Optional[List[Any]] = None, limit: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
-    # 1) Load user preferences from DB (ensure we have fresh object attached to session)
-    prefs: Dict[str, Any] = {"cuisine_preferences": []}
-    try:
-        if user and getattr(user, "id", None):
-            user = get_user_by_id(db, int(user.id)) or user
-            p = getattr(user, "preferences", None)
-            if p:
-                prefs["cuisine_preferences"] = p.cuisine_preferences or []
-                prefs["price_range"] = getattr(p, "price_range", None)
-                prefs["dietary"] = p.dietary_restrictions or []
-            else:
-                prefs["cuisine_preferences"] = []
-    except Exception:
-        prefs["cuisine_preferences"] = []
+def generate_recommendations(
+    db: Session,
+    user: Optional[Any],
+    message: str,
+    conversation_history: Optional[List[Any]] = None,
+    limit: int = 5,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    preferences = _load_user_preferences(db, user)
+    history = _history_messages(conversation_history)
+    extracted = _extract_with_langchain(message, history, preferences) or _simple_extract(message)
+    resolved = _merge_filters(message, extracted, history, preferences)
 
-    # Quick heuristic: if the user is asking a factual lookup (calories, "how many", "what is" etc.)
-    # prefer to use Tavily search/extract to fetch factual content and answer directly.
-    fact_q = False
-    if re.search(r"\b(calorie|calories|how many|what is|who is|when|where|define|definition)\b", message, re.IGNORECASE):
-        fact_q = True
+    if not _is_recommendation_query(message, history):
+        return (
+            "I can help with restaurant recommendations, follow-up refinements, current hours, and vibe-based searches. "
+            "Try something like 'romantic Italian dinner tonight in San Jose' or 'show me something cheaper'.",
+            [],
+        )
 
-    if fact_q:
-        # Try Tavily first for factual content
-        try:
-            from app.config import settings as _settings
-            if _settings.TAVILY_URL:
-                from app.services.ai_agent_tavily import search as tavily_search
-                hits = tavily_search(message, limit=3)
-                try:
-                    # print to console so developers see Tavily hits and why model needn't ask for prefs
-                    logger.info("ai_agent.fact_q tavily hits (truncated): %s", str(hits)[:1000])
-                except Exception:
-                    pass
-                # If hits have snippets, assemble a concise factual answer
-                if hits:
-                    # pick best snippet
-                    best = hits[0]
-                    snippet = (best.get("snippet") or "").strip()
-                    url = best.get("url") or ""
+    search_text = _build_search_text(message, resolved)
+    sort_by = resolved.get("sort_preference") or "recommended"
 
-                    # Try to extract the full article/content using Tavily Extract when a URL is available
-                    full_text = None
-                    try:
-                        if url:
-                            from app.services.ai_agent_tavily import extract as tavily_extract
-                            extracted = tavily_extract(url)
-                            full_text = extracted.get("content") or extracted.get("text") or None
-                            try:
-                                logger.info("ai_agent.fact_q tavily extracted content length: %d", len(full_text or ""))
-                            except Exception:
-                                pass
-                    except Exception:
-                        full_text = None
+    items, _ = restaurant_service.search_restaurants(
+        db,
+        q=search_text,
+        cuisine=resolved.get("cuisine"),
+        location=resolved.get("location"),
+        price_range=resolved.get("price_range"),
+        sort_by=sort_by,
+        page=1,
+        page_size=60,
+    )
 
-                    # Build a combined text to synthesize from
-                    combined = "\n".join([t for t in [snippet, full_text] if t])
+    if not items and resolved.get("location"):
+        items, _ = restaurant_service.search_restaurants(
+            db,
+            q=search_text,
+            cuisine=resolved.get("cuisine"),
+            location=None,
+            price_range=resolved.get("price_range"),
+            sort_by=sort_by,
+            page=1,
+            page_size=60,
+        )
 
-                    # If Ollama available, ask it to synthesize a concise, fully-analyzed answer
-                    try:
-                        if _settings.OLLAMA_URL and _settings.OLLAMA_MODEL:
-                            from app.services.ai_agent_ollama import call_ollama
-                            # prepend a compact system prompt containing user prefs
-                            system_pref = build_system_prompt(user, prefs)
-                            prompt = (
-                                f"{system_pref}\nYou are an expert assistant. Answer the question using the provided web content, and cite the source URL when appropriate."
-                                f"\nQuestion: {message}\n\nContent:\n{combined}\n\nProvide a concise factual answer (1-3 sentences) and include the source URL at the end in parentheses."
-                            )
-                            condensed = call_ollama(prompt, max_tokens=300)
-                            if condensed and isinstance(condensed, str) and condensed.strip():
-                                return condensed.strip(), []
-                    except Exception:
-                        pass
+    if not items and search_text:
+        items, _ = restaurant_service.search_restaurants(
+            db,
+            q=None,
+            cuisine=resolved.get("cuisine"),
+            location=resolved.get("location"),
+            price_range=resolved.get("price_range"),
+            sort_by=sort_by,
+            page=1,
+            page_size=60,
+        )
 
-                    # Fallback local summarization: try to find numeric or calorie info in combined text
-                    if combined:
-                        # look for calorie mentions like '123 kcal' or '123 calories'
-                        m = re.search(r"(\d{2,5})\s*(kcal|calories|cal)", combined, re.IGNORECASE)
-                        if m:
-                            return f"About {m.group(1)} calories (source: {url})", []
+    scored: List[Tuple[float, Any, List[str]]] = []
+    for restaurant in items:
+        score, reasons = _score_restaurant(restaurant, resolved, preferences, search_text)
+        scored.append((score, restaurant, reasons))
+    scored.sort(key=lambda row: row[0], reverse=True)
 
-                        # Otherwise, attempt to return the first 2 sentences from combined
-                        sentences = re.split(r"(?<=[.!?])\s+", combined.strip())
-                        if sentences:
-                            answer = " ".join(sentences[:2])
-                            if url:
-                                answer = f"{answer} (source: {url})"
-                            return answer, []
+    top_rows = scored[:limit]
+    web_context = _maybe_enrich_with_tavily(message, [row[1] for row in top_rows])
 
-                    # Last resort: return the snippet or URL
-                    answer = snippet or f"I found a source: {url}"
-                    return answer, []
-        except Exception:
-            # fall through to normal processing if Tavily fails
-            pass
-
-    # 2) Interpret query
-    # Detect whether the user is explicitly asking for recommendations
-    def _is_recommendation_query(text: str) -> bool:
-        if not text:
-            return False
-        # broaden detection keywords and allow plural/synonyms and fuzzy mentions like 'vegetarian', 'vegan', 'restaurants'
-        keywords = [
-            r"recommend", r"suggest", r"find", r"best", r"nearby", r"near me", r"where to",
-            r"places to", r"restaurants?", r"eat", r"dine", r"vegan", r"vegetarian",
-            r"veggie", r"food options", r"places", r"dinner", r"lunch",
-        ]
-        pattern = r"\b(?:" + r"|".join(keywords) + r")\b"
-        return bool(re.search(pattern, text, re.IGNORECASE))
-
-    rec_query = _is_recommendation_query(message)
-
-    # If this isn't a recommendation query, avoid returning DB recommendation cards; just synthesize an assistant response.
-    if not rec_query and fact_q is False:
-        # fallback simple assistant text using Tavily or rule-based extractor
-        try:
-            # If we have Tavily and Ollama, synthesize a helpful assistant reply without recommending.
-            from app.config import settings as _settings
-            if _settings.TAVILY_URL:
-                from app.services.ai_agent_tavily import search as tavily_search
-                hits = tavily_search(message, limit=3)
-                snippet = hits[0].get("snippet") if hits and isinstance(hits, list) and hits[0] else None
-                if snippet:
-                    # if Ollama is available, condense
-                    try:
-                        if _settings.OLLAMA_URL and _settings.OLLAMA_MODEL:
-                            from app.services.ai_agent_ollama import call_ollama
-                            # include compact system prompt summary so model sees user prefs
-                            system_pref = build_system_prompt(user, prefs)
-                            prompt = f"{system_pref}\nYou are an assistant. Answer succinctly: {message}\n\nContext: {snippet}\n"
-                            condensed = call_ollama(prompt, max_tokens=200)
-                            if condensed:
-                                return condensed.strip(), []
-                    except Exception:
-                        return snippet, []
-        except Exception:
-            pass
-        # default reply
-        return ("I can help with that — tell me if you'd like restaurant recommendations or more details."), []
-    # Flow:
-    #  - If Tavily is configured, call it to obtain web search results.
-    #  - Prefer Ollama for extraction/synthesis if configured and pass web results in the prompt.
-    #  - Otherwise try LangChain/OpenAI if available, then fall back to the simple rule-based extractor.
-    extracted = None
-    try:
-        from app.config import settings as _settings
-        web_results = None
-        # Try Tavily first to gather web results
-        try:
-                if _settings.TAVILY_URL:
-                    from app.services.ai_agent_tavily import search as tavily_search
-                    web_results = tavily_search(message, limit=6)
-                    try:
-                        logger.info("ai_agent.web_results count: %d", len(web_results or []))
-                    except Exception:
-                        pass
-        except Exception:
-            web_results = None
-
-            # If Ollama is available, synthesize/extract using Ollama and include web_results (when present)
-            if _settings.OLLAMA_URL and _settings.OLLAMA_MODEL:
-                from app.services.ai_agent_ollama import call_ollama
-
-                # Gather some user history (recent reviews) to give the model context about likes/dislikes
-                user_history_text = ""
-                try:
-                    if user and getattr(user, "id", None):
-                        reviews, _ = review_service.get_user_reviews(db, user.id, page=1, page_size=10)
-                        if reviews:
-                            # compact representation of what the user liked/disliked
-                            hist_lines: List[str] = []
-                            for rv in reviews:
-                                score = getattr(rv, "rating", None) or getattr(rv, "rating_value", None) or getattr(rv, "score", None) or None
-                                author_note = getattr(rv, "body", None) or getattr(rv, "text", None) or getattr(rv, "content", None) or getattr(rv, "review_text", None) or None
-                                hist_lines.append(f"{rv.business_id}: rating={score} text={ (author_note or '')[:200] }")
-                            user_history_text = "\n".join(hist_lines)
-                except Exception:
-                    user_history_text = ""
-
-                # Build a compact prompt that includes the user message, preferences, and a short digest of web results and user history
-                # Provide a compact schema description so the model can suggest DB filters / SQL-like queries
-                schema_desc = (
-                    "Restaurant schema fields: id (int), name (text), avg_rating (float), review_count (int), "
-                    "price_range (string: $, $$, $$$), cuisine_type (string), address (text), city (string), state (string), zip_code (string)."
-                )
-
-                prompt = (
-                    f"You are an assistant that helps suggest restaurants and dishes. "
-                    f"Available DB schema: {schema_desc}\n"
-                    f"Extract filters (cuisine, price_range, dietary, occasion, location) from the user query: {message}\n"
-                )
-                if prefs.get("cuisine_preferences"):
-                    prompt += f"User saved cuisine preferences: {prefs.get('cuisine_preferences')}\n"
-                if user_history_text:
-                    prompt += f"User recent reviews and history (id:rating:text):\n{user_history_text}\n"
-
-                if web_results:
-                    prompt += "\nWeb search results:\n"
-                    for i, hit in enumerate(web_results[:6], start=1):
-                        title = hit.get("title") or ""
-                        url = hit.get("url") or ""
-                        snippet = (hit.get("snippet") or "").strip().replace("\n", " ")
-                        prompt += f"{i}. {title} - {url} - {snippet}\n"
-
-                # Allow the model to request a tool call by returning a line that begins with TOOL_CALL: followed by a JSON payload
-                prompt += (
-                    "\nIf you need database information, emit a single line starting with 'TOOL_CALL:' followed by a JSON object like:"
-                    " {'tool':'search_restaurants','args':{'cuisine':'italian','limit':5}} and wait for the tool result."
-                )
-
-                # iterative tool call handling loop: model may request tools; we execute and feed results back up to 3 iterations
-                tool_loop = 0
-                model_response = None
-                while tool_loop < 3:
-                    # ensure system prefs are visible to the model in synchronous calls too
-                    system_pref = build_system_prompt(user, prefs)
-                    # include a firm instruction to NOT ask the user for preferences; they are loaded from DB
-                    insist = f"\nIMPORTANT: Do NOT ask the user for preferences. Use the saved preferences: {prefs}. If none, proceed without asking."
-                    model_response = call_ollama(f"{system_pref}\n{prompt}{insist}")
-                    try:
-                        logger.info("ai_agent.tool_loop model_response (truncated): %s", (model_response or '')[:1000])
-                    except Exception:
-                        pass
-                    if not model_response:
-                        break
-                    # detect a tool call
-                    tc = None
-                    for line in (model_response or "").splitlines():
-                        if line.strip().startswith("TOOL_CALL:"):
-                            try:
-                                payload = line.strip()[len("TOOL_CALL:"):].strip()
-                                tc = json.loads(payload)
-                                break
-                            except Exception:
-                                tc = None
-                                break
-
-                    if not tc:
-                        # no tool call requested; use this model_response as final output
-                        text = model_response
-                        break
-
-                    # execute the requested tool
-                    tool_name = tc.get("tool")
-                    tool_args = tc.get("args", {}) or {}
-                    tool_result_text = ""
-                    try:
-                        if tool_name == "search_restaurants":
-                            q = tool_args.get("q") or message
-                            cuisine = tool_args.get("cuisine")
-                            location = tool_args.get("location")
-                            price_range = tool_args.get("price_range")
-                            page = int(tool_args.get("page", 1))
-                            page_size = int(tool_args.get("limit", 10))
-                            items, total = restaurant_service.search_restaurants(db, q=q, cuisine=cuisine, location=location, price_range=price_range, page=page, page_size=page_size)
-                            # compact JSON-serializable summary
-                            tool_result_text = json.dumps([_restaurant_to_recommendation(r) for r in items[:page_size]])
-                            try:
-                                logger.info("ai_agent.tool_result search_restaurants returned %d items", len(items))
-                            except Exception:
-                                pass
-                        elif tool_name == "get_user_reviews":
-                            uid = tool_args.get("user_id") or (user.id if user else None)
-                            if uid:
-                                revs, total = review_service.get_user_reviews(db, int(uid), page=1, page_size=10)
-                                tool_result_text = json.dumps([{"business_id": r.business_id, "rating": getattr(r, 'rating', None) or getattr(r, 'rating_value', None) or None, "text": (getattr(r, 'body', None) or getattr(r, 'text', None) or '')[:400]} for r in revs])
-                                try:
-                                    logger.info("ai_agent.tool_result get_user_reviews count: %d", len(revs))
-                                except Exception:
-                                    pass
-                            else:
-                                tool_result_text = json.dumps([])
-                        else:
-                            tool_result_text = json.dumps({"error": "unknown tool"})
-                    except Exception as e:
-                        tool_result_text = json.dumps({"error": str(e)})
-
-                    # append tool result to the prompt and loop so the model can synthesize using tool output
-                    prompt += f"\nTool result for {tool_name}: {tool_result_text}\n"
-                    tool_loop += 1
-
-                # if model_response wasn't set above for some reason, set it from last call
-                if model_response and not extracted:
-                    text = model_response
-
-                # small parse: look for lines like 'cuisine: italian' or 'cuisine = italian'
-                extracted = {}
-                for part in ["cuisine", "price_range", "dietary", "occasion", "location"]:
-                    m = re.search(fr"{part}[:=]\s*([\w\s$-]+)", (text or ""), re.IGNORECASE)
-                    extracted[part] = m.group(1).strip() if m else None
-    except Exception:
-        extracted = None
-
-    # If not extracted yet, try LangChain/OpenAI if available, otherwise use rule-based extractor
-    if not extracted:
-        try:
-            from langchain import LLMChain  # type: ignore
-            from langchain.llms import OpenAI  # type: ignore
-            # Not calling LLM here automatically in typical dev envs; fall back to rule-based
-            extracted = _simple_extract(message)
-        except Exception:
-            extracted = _simple_extract(message)
-
-    cuisine = extracted.get("cuisine")
-    price_range = extracted.get("price_range")
-    dietary = extracted.get("dietary")
-    location = extracted.get("location")
-
-    # 3) Query DB using restaurant_service
-    # Use q=message as fallback search text
-    items, total = restaurant_service.search_restaurants(db, q=message, cuisine=cuisine, location=location, price_range=price_range, page=1, page_size=50)
-
-    # 4) Rank results by simple scoring: rating + preference match
-    def score(r):
-        s = float(r.avg_rating or 0) * 10
-        # bonus if cuisine matches user prefs or extracted cuisine
-        if cuisine and r.cuisine_type and cuisine.lower() in (r.cuisine_type or "").lower():
-            s += 5
-        for pref in prefs.get("cuisine_preferences", []):
-            if pref and r.cuisine_type and pref.lower() in (r.cuisine_type or "").lower():
-                s += 3
-        # price match
-        if price_range and r.price_range == price_range:
-            s += 2
-        # dietary: if vegan requested and cuisine mentions vegan or 'vegan_friendly' flag, boost (best-effort)
-        return s
-
-    scored = sorted(items, key=score, reverse=True)
-    top = scored[:limit]
-
-    recommendations = []
-    reasons = []
-    for r in top:
-        rec = _restaurant_to_recommendation(r)
-        # reason generation: small template
-        reason_parts = []
-        if cuisine and r.cuisine_type and cuisine.lower() in (r.cuisine_type or "").lower():
-            reason_parts.append(f"Matches requested cuisine: {cuisine}")
-        if prefs.get("cuisine_preferences") and any(pref.lower() in (r.cuisine_type or "").lower() for pref in prefs.get("cuisine_preferences", [])):
-            reason_parts.append("Matches your saved cuisine preferences")
-        if r.price_range:
-            reason_parts.append(f"Price: {r.price_range}")
-        rec["reason"] = "; ".join(reason_parts) or "Highly rated and matches your query"
+    recommendations: List[Dict[str, Any]] = []
+    for _, restaurant, reasons in top_rows:
+        rec = _restaurant_to_recommendation(restaurant)
+        final_reasons = list(reasons)
+        if restaurant.id in web_context:
+            final_reasons.append(f"current web note: {web_context[restaurant.id]}")
+        rec["reason"] = "; ".join(_dedupe(final_reasons)) or "strong overall match for your request"
         recommendations.append(rec)
 
-    assistant_text = "Here are a few recommendations based on your query and preferences."
+    assistant_text = _build_assistant_text(resolved, preferences, recommendations, bool(web_context))
     return assistant_text, recommendations
 
 
-def stream_recommendations(db: Session, user: Optional[Any], message: str, conversation_history: Optional[List[Any]] = None, limit: int = 5):
-    """Generator that streams assistant text chunks (from Ollama) and yields a tuple
-    ('assistant_chunk', text) for each token/chunk, then yields ('recommendation', rec) items,
-    and finally returns a summary string and list of recommendations.
-    """
-    from app.config import settings as _settings
-    from app.services.ai_agent_tavily import search as tavily_search, extract as tavily_extract
-    from app.services.ai_agent_ollama import stream_ollama
+def _chunk_text(text: str, chunk_size: int = 220) -> List[str]:
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks: List[str] = []
+    buffer = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if len(buffer) + len(sentence) + 1 <= chunk_size:
+            buffer = f"{buffer} {sentence}".strip()
+        else:
+            if buffer:
+                chunks.append(buffer)
+            buffer = sentence
+    if buffer:
+        chunks.append(buffer)
+    return chunks or [text]
 
-    # If factual query, attempt to fetch web content first
-    fact_q = False
-    if re.search(r"\b(calorie|calories|how many|what is|who is|when|where|define|definition)\b", message, re.IGNORECASE):
-        fact_q = True
 
-    web_results = None
-    if _settings.TAVILY_URL:
-        try:
-            web_results = tavily_search(message, limit=5)
-        except Exception:
-            web_results = None
-
-    content_for_prompt = ""
-    if fact_q and web_results and isinstance(web_results, list) and web_results and web_results[0].get("url"):
-        try:
-            extracted = tavily_extract(web_results[0]["url"])
-            content_for_prompt = extracted.get("content") or extracted.get("text") or ""
-        except Exception:
-            content_for_prompt = ""
-
-    # Load a compact copy of user preferences so we can inject them into the system prompt for streaming calls
-    prefs: Dict[str, Any] = {"cuisine_preferences": []}
-    try:
-        if user and getattr(user, "id", None):
-            from app.services.user_service import get_user_by_id
-            user = get_user_by_id(db, int(user.id)) or user
-            p = getattr(user, "preferences", None)
-            if p:
-                prefs["cuisine_preferences"] = p.cuisine_preferences or []
-                prefs["price_range"] = getattr(p, "price_range", None)
-                prefs["dietary"] = p.dietary_restrictions or []
-            else:
-                prefs["cuisine_preferences"] = []
-    except Exception:
-        prefs["cuisine_preferences"] = []
-
-    # Build a succinct prompt and prepend a compact system prompt with user prefs
-    from app.services.ai_agent import build_system_prompt
-    system_pref = build_system_prompt(user, prefs)
-    prompt = f"{system_pref}\nYou are an assistant. Answer: {message}\n{content_for_prompt}\n"
-
-    # Stream tokens from Ollama and yield assistant_chunk tuples
-    full_text_parts: List[str] = []
-    try:
-        for chunk in stream_ollama(prompt):
-            # normalize and yield
-            text_chunk = chunk if isinstance(chunk, str) else str(chunk)
-            full_text_parts.append(text_chunk)
-            yield ("assistant_chunk", text_chunk)
-    except Exception as e:
-        # fall back to non-streaming path if streaming fails
-        yield ("assistant_chunk", f"[assistant error: {e}]")
-
-    full_text = "".join(full_text_parts)
-
-    # After streaming assistant text, run the same recommendation logic (non-streaming) to produce recs
-    # Reuse generate_recommendations' DB search/ranking: call it to get recommendations (this will call Ollama sync if configured,
-    # but we've already streamed a response; however for ranking we'll rely on DB)
-    try:
-        assistant_summary, recommendations = generate_recommendations(db, user, message, conversation_history, limit=limit)
-    except Exception:
-        assistant_summary, recommendations = (full_text[:300] if full_text else ""), []
-
-    # yield recommendations
-    for rec in recommendations:
-        yield ("recommendation", rec)
-
-    # final result (not yielded as event, but return for callers that want it)
-    return assistant_summary, recommendations
+def stream_recommendations(
+    db: Session,
+    user: Optional[Any],
+    message: str,
+    conversation_history: Optional[List[Any]] = None,
+    limit: int = 5,
+):
+    assistant_text, recommendations = generate_recommendations(
+        db,
+        user,
+        message,
+        conversation_history,
+        limit=limit,
+    )
+    for chunk in _chunk_text(assistant_text):
+        yield ("assistant_chunk", chunk)
+    for recommendation in recommendations:
+        yield ("recommendation", recommendation)
+    return assistant_text, recommendations
