@@ -33,23 +33,11 @@ def get_user_reviews(db: Session, user_id: int, page: int = 1, page_size: int = 
     )
     total = query.count()
     items = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    # Fallback: some reviews (from imports or seeders) may not have user_id set
-    # but do have author_name populated. If the user has no tied reviews, try
-    # to find reviews whose author_name matches the current user's name
-    # (case-insensitive, partial match).
-    if total == 0:
-        user = db.query(User).filter(User.id == user_id).first()
-        if user and user.name:
-            author_query = (
-                db.query(Review)
-                .options(joinedload(Review.user), joinedload(Review.photos), joinedload(Review.restaurant))
-                .filter(Review.author_name.ilike(f"%{user.name}%"))
-                .order_by(Review.created_at.desc())
-            )
-            total = author_query.count()
-            items = author_query.offset((page - 1) * page_size).limit(page_size).all()
-
+    # NOTE: aggregate by numeric user_id only. Previously we attempted a
+    # fallback that matched on author_name for imported reviews; that could
+    # incorrectly attribute reviews to a user based on name collisions. To
+    # ensure history is accurate and not vulnerable to ambiguous name matches,
+    # we now return only reviews explicitly tied to the user's id.
     return items, total
 
 
