@@ -38,7 +38,7 @@ export default function LoginPage() {
 
         <div className="rounded-[2rem] border border-gray-200 bg-white p-8 shadow-xl">
           <div className="mb-8">
-            <Link to="/" className="text-3xl font-black text-red-600">yelp*</Link>
+            <Link to="/" className="text-3xl font-black text-red-600">yelp</Link>
             <p className="mt-2 text-sm text-gray-500">Sign in to continue</p>
           </div>
 

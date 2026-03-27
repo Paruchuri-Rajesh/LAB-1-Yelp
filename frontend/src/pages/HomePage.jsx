@@ -8,12 +8,7 @@ import { searchRestaurants } from '../api/restaurants'
 import { useAuth } from '../contexts/AuthContext'
 import ChatWidget from '../components/chat/ChatWidget'
 
-const QUICK_LINKS = [
-  'Dinner tonight',
-  'Outdoor seating',
-  'Best rated near me',
-  'Brunch spots',
-]
+
 
 export default function HomePage() {
   const { user } = useAuth()
@@ -41,13 +36,7 @@ export default function HomePage() {
             <div className="mt-8 max-w-4xl">
               <SearchBar initialLocation="Union City, CA 94587" />
             </div>
-            <div className="mt-5 flex flex-wrap gap-2">
-              {QUICK_LINKS.map((item) => (
-                <button key={item} type="button" className="rounded-full border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-white">
-                  {item}
-                </button>
-              ))}
-            </div>
+            
           </div>
           <div className="overflow-hidden rounded-[2rem] border border-gray-200 bg-white shadow-xl">
             <img src={heroImage} alt="Restaurant preview" className="h-full w-full object-cover" />
@@ -80,14 +69,6 @@ export default function HomePage() {
 
       <section className="border-t border-gray-200 bg-gray-50 px-4 py-14">
         <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-3">
-          <div className="rounded-3xl border border-gray-200 bg-white p-7">
-            <h3 className="text-xl font-bold text-gray-950">MySQL-first backend</h3>
-            <p className="mt-2 text-sm text-gray-600">No Docker required. Create the database locally, run the setup SQL once, then let FastAPI create the application tables.</p>
-          </div>
-          <div className="rounded-3xl border border-gray-200 bg-white p-7">
-            <h3 className="text-xl font-bold text-gray-950">Yelp API import</h3>
-            <p className="mt-2 text-sm text-gray-600">Pull restaurant data, photos, hours, and available Yelp review snippets into MySQL for fast search and filtering.</p>
-          </div>
           <div className="rounded-3xl border border-gray-200 bg-white p-7">
             <h3 className="text-xl font-bold text-gray-950">Owner dashboard</h3>
             <p className="mt-2 text-sm text-gray-600">Owners can claim restaurants, review analytics, and update their restaurant metadata from one place.</p>

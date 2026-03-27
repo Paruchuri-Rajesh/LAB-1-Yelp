@@ -39,7 +39,7 @@ export default function Navbar() {
     <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/95 backdrop-blur">
       <div className="mx-auto flex max-w-7xl items-center gap-4 px-4 py-4">
         <Link to="/" className="flex items-center gap-2 shrink-0">
-          <span className="rounded-xl bg-red-600 px-3 py-2 text-xl font-black tracking-tight text-white">yelp*</span>
+          <span className="rounded-xl bg-red-600 px-3 py-2 text-xl font-black tracking-tight text-white">yelp</span>
         </Link>
 
         <form onSubmit={submit} className="hidden flex-1 items-center overflow-hidden rounded-2xl border border-gray-200 md:flex">
